@@ -18,6 +18,7 @@ Examples:
 
 # Standard
 from typing import Optional
+from uuid import uuid4
 
 # Third-Party
 from sqlalchemy.orm import Session
@@ -103,13 +104,17 @@ class PersonalTeamService:
             display_name = user.get_display_name()
             team_name = f"{display_name}'s Team"
 
-            # Create team slug — use prefix from config if set, otherwise derive from display name
+            # Preserve custom prefixes; default slugs need uniqueness beyond the display name.
             prefix = slugify(settings.personal_team_prefix.strip()) if settings.personal_team_prefix.strip() else ""
             if prefix:
                 email_slug = user.email.replace("@", "-").replace(".", "-").lower()
                 team_slug = f"{prefix}-{email_slug}"
             else:
-                team_slug = slugify(team_name)
+                separator = settings.gateway_tool_name_separator
+                name_budget = 255 - len(separator) - 32
+                name_slug = slugify(team_name)[:name_budget].rstrip(separator)
+                unique_suffix = uuid4().hex
+                team_slug = f"{name_slug}{separator}{unique_suffix}" if name_slug else unique_suffix
 
             # Create the personal team
             team = EmailTeam(

@@ -8,6 +8,7 @@ Comprehensive tests for Personal Team Service functionality.
 
 # Standard
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 # Third-Party
 import pytest
@@ -20,6 +21,12 @@ from mcpgateway.services.personal_team_service import PersonalTeamService
 
 class TestPersonalTeamService:
     """Comprehensive test suite for Personal Team Service."""
+
+    @pytest.fixture(autouse=True)
+    def mock_slug_uuid(self):
+        """Use a deterministic UUID for default slug assertions."""
+        with patch("mcpgateway.services.personal_team_service.uuid4", return_value=UUID(int=1)) as mock_uuid:
+            yield mock_uuid
 
     @pytest.fixture
     def mock_db(self):
@@ -120,7 +127,7 @@ class TestPersonalTeamService:
             assert result == mock_team
             MockTeam.assert_called_once_with(
                 name="Test User's Team",
-                slug="test-users-team",
+                slug="test-users-team-00000000000000000000000000000001",
                 description="Personal workspace for testuser@example.com",
                 created_by="testuser@example.com",
                 is_personal=True,
@@ -167,10 +174,12 @@ class TestPersonalTeamService:
 
             result = await service.create_personal_team(user)
 
-            # Verify slug generation with default empty prefix uses slugify(team_name)
+            assert result == mock_team
+
+            # Verify the default slug includes a unique suffix.
             MockTeam.assert_called_once()
             call_args = MockTeam.call_args[1]
-            assert call_args["slug"] == "special-users-team"
+            assert call_args["slug"] == "special-users-team-00000000000000000000000000000001"
             assert call_args["name"] == "Special User's Team"
 
     @pytest.mark.asyncio
@@ -405,11 +414,11 @@ class TestPersonalTeamService:
 
             assert result == mock_team
             call_args = MockTeam.call_args[1]
-            # Default empty prefix: slug derived from display name
-            assert call_args["slug"] == "long-email-users-team"
+            # Default slugs retain the readable display name.
+            assert call_args["slug"] == "long-email-users-team-00000000000000000000000000000001"
 
     @pytest.mark.asyncio
-    async def test_create_personal_team_with_prefix(self, service, mock_db, mock_user):
+    async def test_create_personal_team_with_prefix(self, service, mock_db, mock_user, mock_slug_uuid):
         """Test personal team creation uses PERSONAL_TEAM_PREFIX when set."""
         mock_db.query.return_value.filter.return_value.first.return_value = None
 
@@ -428,13 +437,14 @@ class TestPersonalTeamService:
             assert result == mock_team
             call_args = MockTeam.call_args[1]
             assert call_args["slug"] == "workspace-testuser-example-com"
+            mock_slug_uuid.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "raw_prefix,expected_slug",
         [
-            ("   ", "test-users-team"),  # whitespace-only falls back to display name
-            ("!!!", "test-users-team"),  # punctuation-only slugifies to empty, falls back
+            ("   ", "test-users-team-00000000000000000000000000000001"),  # whitespace-only uses the default slug
+            ("!!!", "test-users-team-00000000000000000000000000000001"),  # punctuation-only uses the default slug
             ("Team Ops!", "team-ops-testuser-example-com"),  # normalized to valid slug prefix
         ],
     )
@@ -448,6 +458,7 @@ class TestPersonalTeamService:
             patch("mcpgateway.services.personal_team_service.settings") as mock_settings,
         ):
             mock_settings.personal_team_prefix = raw_prefix
+            mock_settings.gateway_tool_name_separator = "-"
             mock_team = MagicMock()
             mock_team.id = "norm-team-id"
             MockTeam.return_value = mock_team
@@ -456,6 +467,85 @@ class TestPersonalTeamService:
 
             call_args = MockTeam.call_args[1]
             assert call_args["slug"] == expected_slug
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "display_names,emails",
+        [
+            (("张三", "李四"), ("zhang@example.com", "li@example.com")),
+            (("Same Name", "Same Name"), ("first@example.com", "second@example.com")),
+            (("张三", "李四"), ("a.b@example.com", "a-b@example.com")),
+        ],
+    )
+    async def test_default_slugs_are_unique_across_users(self, service, mock_db, mock_slug_uuid, display_names, emails):
+        """Keep slugs distinct when display names or normalized emails collide."""
+        mock_slug_uuid.side_effect = [UUID(int=1), UUID(int=2)]
+        with patch("mcpgateway.services.personal_team_service.settings") as mock_settings:
+            mock_settings.personal_team_prefix = ""
+            mock_settings.gateway_tool_name_separator = "-"
+            teams = []
+            for display_name, email in zip(display_names, emails):
+                user = MagicMock(spec=EmailUser)
+                user.email = email
+                user.get_display_name.return_value = display_name
+                teams.append(await service.create_personal_team(user))
+
+        assert teams[0].slug != teams[1].slug
+        for index, team in enumerate(teams):
+            assert team.slug.endswith(UUID(int=index + 1).hex)
+            assert team.name == f"{display_names[index]}'s Team"
+        assert mock_db.commit.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_default_slug_fits_database_column(self, service, mock_user):
+        """Retain the complete unique suffix when truncating long names."""
+        mock_user.get_display_name.return_value = "a" * 300
+        with patch("mcpgateway.services.personal_team_service.settings") as mock_settings:
+            mock_settings.personal_team_prefix = ""
+            mock_settings.gateway_tool_name_separator = "-"
+            team = await service.create_personal_team(mock_user)
+
+        assert len(team.slug) == 255
+        assert team.slug == f"{'a' * 222}-{UUID(int=1).hex}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("separator", ["-", "--", "_", "."])
+    @pytest.mark.parametrize("name_case", ["readable", "at_limit", "over_limit", "trailing_separator", "empty"])
+    async def test_default_slug_separator_and_boundaries(self, service, mock_user, separator, name_case):
+        """Honor configured separators across empty names and truncation boundaries."""
+        name_budget = 255 - len(separator) - 32
+        display_names = {
+            "readable": "Test User",
+            "at_limit": "a" * (name_budget - len("s" + separator + "team")),
+            "over_limit": "a" * 300,
+            "trailing_separator": "a" * (name_budget - 1) + " b",
+            "empty": "",
+        }
+        mock_user.get_display_name.return_value = display_names[name_case]
+        with (
+            patch("mcpgateway.services.personal_team_service.settings.personal_team_prefix", ""),
+            patch("mcpgateway.services.personal_team_service.settings.gateway_tool_name_separator", separator),
+        ):
+            if name_case == "empty":
+                with patch("mcpgateway.services.personal_team_service.slugify", return_value=""):
+                    team = await service.create_personal_team(mock_user)
+            else:
+                team = await service.create_personal_team(mock_user)
+
+        suffix = UUID(int=1).hex
+        expected_names = {
+            "readable": f"test{separator}users{separator}team",
+            "at_limit": f"{display_names[name_case]}s{separator}team",
+            "over_limit": "a" * name_budget,
+            "trailing_separator": "a" * (name_budget - 1),
+        }
+        if name_case == "empty":
+            assert team.slug == suffix
+        else:
+            assert team.slug == f"{expected_names[name_case]}{separator}{suffix}"
+        assert len(team.slug) <= 255
+        if name_case in {"at_limit", "over_limit"}:
+            assert len(team.slug) == 255
 
     @pytest.mark.asyncio
     async def test_create_personal_team_rollback_on_flush_error(self, service, mock_db, mock_user):
